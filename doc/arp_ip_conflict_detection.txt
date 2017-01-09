@@ -1,0 +1,187 @@
+--------------------------------------------------------------------------------
+- 内核Documentation/networking/ip-sysctl.txt中对arp_notify参数的描述如下：
+
+  arp_notify - BOOLEAN
+	Define mode for notification of address and device changes.
+	0 - (default): do nothing
+	1 - Generate gratuitous arp requests when device is brought up or hardware 
+        address changes.
+
+  arp_accept - BOOLEAN
+  	Define behavior for gratuitous ARP frames who's IP is not
+  	already present in the ARP table:
+  	0 - don't create new entries in the ARP table
+  	1 - create new entries in the ARP table
+  
+  	Both replies and requests type gratuitous arp will trigger the
+  	ARP table to be updated, if this setting is on.
+  
+  	If the ARP table already contains the IP address of the
+  	gratuitous arp frame, the arp table will be updated regardless
+  	if this setting is on or off.
+
+在include/linux/inetdevice.h中定义了
+
+#define IN_DEV_ARPFILTER(in_dev)	IN_DEV_ORCONF((in_dev), ARPFILTER)
+#define IN_DEV_ARP_ACCEPT(in_dev)	IN_DEV_ORCONF((in_dev), ARP_ACCEPT)
+#define IN_DEV_ARP_ANNOUNCE(in_dev)	IN_DEV_MAXCONF((in_dev), ARP_ANNOUNCE)
+#define IN_DEV_ARP_IGNORE(in_dev)	IN_DEV_MAXCONF((in_dev), ARP_IGNORE)
+#define IN_DEV_ARP_NOTIFY(in_dev)	IN_DEV_MAXCONF((in_dev), ARP_NOTIFY)
+
+用来判断是否设置了这些配置。
+
+似乎有所缺失，例如在IP更改时（手动或者DHCP获得），应该也需要发送ARP
+（Probe或Annoucement）来进行检测。需要进一步确认效果。
+
+使用以下命令改写该配置:
+
+    # sysctl -w net.ipv4.conf.all.arp_notify=1
+
+net/ipv4/devinet.c
+--------------------------------------------------------------------------------
+
+inetdev_event()
+\_  case 
+        NETDEV_UP:
+        NETDEV_CHANGEADDR:
+        NETDEV_NOTIFY_PEERS:
+        /* Send gratuitous ARP to notify of link change */
+        inetdev_send_gratuitous_arp()
+
+网络事件的宏定义在include/linux/netdevice.h中:
+
+#define NETDEV_UP	        0x0001	/* For now you can't veto a device up/down */
+#define NETDEV_DOWN	        0x0002
+#define NETDEV_REBOOT	    0x0003	/* Tell a protocol stack a network interface
+				                    detected a hardware crash and restarted
+				                    - we can use this eg to kick tcp sessions
+				                    once done */
+#define NETDEV_CHANGE	    0x0004	/* Notify device state change */
+#define NETDEV_REGISTER     0x0005
+#define NETDEV_UNREGISTER	0x0006
+#define NETDEV_CHANGEMTU	0x0007
+#define NETDEV_CHANGEADDR	0x0008
+#define NETDEV_GOING_DOWN	0x0009
+#define NETDEV_CHANGENAME	0x000A
+#define NETDEV_FEAT_CHANGE	0x000B
+#define NETDEV_BONDING_FAILOVER 0x000C
+#define NETDEV_PRE_UP		0x000D
+#define NETDEV_PRE_TYPE_CHANGE	0x000E
+#define NETDEV_POST_TYPE_CHANGE	0x000F
+#define NETDEV_POST_INIT	0x0010
+#define NETDEV_UNREGISTER_FINAL 0x0011
+#define NETDEV_RELEASE		0x0012
+#define NETDEV_NOTIFY_PEERS	0x0013
+#define NETDEV_JOIN		0x0014
+
+
+arp.c
+--------------------------------------------------------------------------------
+arp.c中，arp_netdev_event()中对NETDEV_CHANGEADDR时间会进行处理
+
+
+RFC 5227
+--------------------------------------------------------------------------------
+- 处理动作:
+  - 在进行配置，应该进行probe
+    在配置IP时、重新使能网卡时、从休眠中恢复时、重新连接网线时、无线连接到新AP
+    时等等。需要进行IP可用性的探测，使用ARP广播探测包。
+
+    配置IP: NETDEV_CHANGEADDR
+    重新使能网卡、从休眠中修复: NETDEV_UP
+    重新连接网线：
+    无线重新连接到新AP:
+    重新连接网线、
+
+   probe包格式: [sIP: 00, sHW: XXXX, dIP: xxxx, dHW: 00]
+   需要根据一定间隔、一定数目发送probe包
+   如果一定超时之后，如果在该接口上收到'发送者IP地址'为需要probe的地址的arp
+   包(请求或应答)，那么表示需要更换地址了。
+   此外，如果收到了ARP probe，里面target IP地址为该主机probe的地址并且该包
+   的sHW不是本机的任何一个接口硬件地址，那么也要作为冲突处理。因为可能同网段
+   中可能有另一个主机在对同样的IP地址进行probe。
+   注意：检测sHW是不是本机的硬件地址很重要！因为有些hub会将广播包发送给发送者。
+   为了防止ARP风暴，主机在一定时间只能进行一定次数的ARP probe。
+
+   在probe到地址可用之后，必须announce该地址将要被使用。作用是更新其他主机
+   上的ARP缓存，可能该地址之前被其他主机使用过。在发送一定个数的announce包
+   之后就可以正式开始使用新地址了。
+
+  - 持续检测：对每一个接收到的arp包和自身的信息进行判断
+
+    在最初的配置之后，持续的冲突检测是必须的。如果主机收到了ARP包（请求或回复）
+    的sIP是主机上的IP地址并且sHW地址不是主机的物理地址，那么就是冲突了。解决
+    冲突有以下几种方式：
+    (a) 立刻停止使用该地址，并通知配置主体
+    
+    (b) 如果主机因为当前有活动的TCP连接或其他理由，需要保留该地址，并且
+        在DEFEND_INTERVAL期间没有再检测到再次的冲突，那么主机可以通过发送
+
+    (c) 如果因为某些原因主机需要固定IP，那么在冲突时可以一直进行防御。
+        但是不能一直发送ARP announce包，防止双发进行死循环发送，造成带宽浪费。
+        announce包来防御。
+
+
+// ARP OPCODE
+#define	ARPOP_REQUEST	1		/* ARP request			*/
+#define	ARPOP_REPLY	2		/* ARP reply			*/
+#define	ARPOP_RREQUEST	3		/* RARP request			*/
+#define	ARPOP_RREPLY	4		/* RARP reply			*/
+#define	ARPOP_InREQUEST	8		/* InARP request		*/
+#define	ARPOP_InREPLY	9		/* InARP reply			*/
+#define	ARPOP_NAK	10		/* (ATM)ARP NAK			*/
+
+内核中include/uapi/linux/if_arp.h中定义了arp包的包头结构体struct arphdr。
+struct arphdr {
+	__be16		ar_hrd;		/* format of hardware address	*/
+	__be16		ar_pro;		/* format of protocol address	*/
+	unsigned char	ar_hln;		/* length of hardware address	*/
+	unsigned char	ar_pln;		/* length of protocol address	*/
+	__be16		ar_op;		/* ARP opcode (command)		*/
+};
+
+内核中include/uapi/linux/if_ether.h中定义了以太网包头 struct ethhdr
+
+struct ethhdr {
+	unsigned char	h_dest[ETH_ALEN];	/* destination eth addr	*/
+	unsigned char	h_source[ETH_ALEN];	/* source ether addr	*/
+	__be16		h_proto;		/* packet type ID field	*/
+} __attribute__((packed));
+
+
+在/usr/include中netinet/if_ether.h中定义了以太网ARP包结构体 struct ether_arp.
+但是该变量在非BSD平台上是不无效。
+struct	ether_arp {
+	struct	arphdr ea_hdr;		/* fixed-size header */
+	u_int8_t arp_sha[ETH_ALEN];	/* sender hardware address */
+	u_int8_t arp_spa[4];		/* sender protocol address */
+	u_int8_t arp_tha[ETH_ALEN];	/* target hardware address */
+	u_int8_t arp_tpa[4];		/* target protocol address */
+};
+
+因此，一个完整的ethernet上的ARP包结构为:
+
+
+struct ethhdr | struct ether_arp;
+
+将结构体全部展开，即为:
+{
+    // struct ethhdr, size = 14
+	unsigned char	h_dest[ETH_ALEN];	/* destination eth addr	*/
+	unsigned char	h_source[ETH_ALEN];	/* source ether addr	*/
+	__be16		h_proto;		/* packet type ID field	*/
+
+    // struct arphdr, size = 8
+	__be16		ar_hrd;		/* format of hardware address	*/
+	__be16		ar_pro;		/* format of protocol address	*/
+	unsigned char	ar_hln;		/* length of hardware address	*/
+	unsigned char	ar_pln;		/* length of protocol address	*/
+	__be16		ar_op;		/* ARP opcode (command)		*/
+
+    // from struct ether_arp, size = 20
+	u_int8_t arp_sha[ETH_ALEN];	/* sender hardware address */
+	u_int8_t arp_spa[4];		/* sender protocol address */
+	u_int8_t arp_tha[ETH_ALEN];	/* target hardware address */
+	u_int8_t arp_tpa[4];		/* target protocol address */
+}
+
